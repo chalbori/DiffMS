@@ -39,7 +39,8 @@ def get_resume(cfg, model_kwargs):
     test_samples_to_generate = cfg.general.test_samples_to_generate
     gpus = cfg.general.gpus
 
-    model = Spec2MolDenoisingDiffusion.load_from_checkpoint(resume, **model_kwargs)
+    map_location = None if torch.cuda.is_available() else 'cpu'
+    model = Spec2MolDenoisingDiffusion.load_from_checkpoint(resume, map_location=map_location, **model_kwargs)
 
     cfg = model.cfg
     cfg.general.test_only = resume
@@ -135,6 +136,11 @@ def apply_decoder_finetuning(model, strategy):
     else:
         raise NotImplementedError(f'Unknown Finetune Strategy: {strategy}')
 
+def _is_pl_checkpoint(path):
+    ckpt = torch.load(path, map_location='cpu')
+    return 'pytorch-lightning_version' in ckpt
+
+
 def load_weights(model, path):
     """
     Loads only the weights from a checkpoint file into the model without loading the full Lightning module.
@@ -213,8 +219,9 @@ def main(cfg: DictConfig):
 
     if cfg.general.test_only:
         # When testing, previous configuration is fully loaded
-        cfg, _ = get_resume(cfg, model_kwargs)
-        #os.chdir(cfg.general.test_only.split('checkpoints')[0])
+        if _is_pl_checkpoint(cfg.general.test_only):
+            cfg, _ = get_resume(cfg, model_kwargs)
+        # else: raw state dict — keep current config, weights loaded later
     elif cfg.general.resume is not None:
         # When resuming, we can override some parts of previous configuration
         cfg, _ = get_resume_adaptive(cfg, model_kwargs)
@@ -252,11 +259,18 @@ def main(cfg: DictConfig):
         WandbLogger(name=name, save_dir=f"logs/{name}", project=cfg.general.wandb_name, log_model=False, config=utils.cfg_to_dict(cfg))
     ]
 
-    use_gpu = cfg.general.gpus > 0 and torch.cuda.is_available()
+    use_cuda = cfg.general.gpus > 0 and torch.cuda.is_available()
+    use_mps = not use_cuda and torch.backends.mps.is_available()
+    if use_cuda:
+        accelerator, devices, strategy = 'gpu', cfg.general.gpus, "ddp_find_unused_parameters_true"
+    elif use_mps:
+        accelerator, devices, strategy = 'mps', 1, 'auto'
+    else:
+        accelerator, devices, strategy = 'cpu', 1, "ddp_find_unused_parameters_true"
     trainer = Trainer(gradient_clip_val=cfg.train.clip_grad,
-                      strategy="ddp_find_unused_parameters_true",  # Needed to load old checkpoints
-                      accelerator='gpu' if use_gpu else 'cpu',
-                      devices=cfg.general.gpus if use_gpu else 1,
+                      strategy=strategy,
+                      accelerator=accelerator,
+                      devices=devices,
                       max_epochs=cfg.train.n_epochs,
                       check_val_every_n_epoch=cfg.general.check_val_every_n_epochs,
                       fast_dev_run=cfg.general.name == 'debug',
@@ -270,14 +284,20 @@ def main(cfg: DictConfig):
     if cfg.general.load_weights is not None:
         logging.info(f"Loading weights from {cfg.general.load_weights}")
         model = load_weights(model, cfg.general.load_weights)
+    elif cfg.general.test_only and not _is_pl_checkpoint(cfg.general.test_only):
+        logging.info(f"Loading raw state dict from {cfg.general.test_only}")
+        model = load_weights(model, cfg.general.test_only)
 
     if not cfg.general.test_only:
         trainer.fit(model, datamodule=datamodule, ckpt_path=cfg.general.resume)
         if cfg.general.name not in ['debug', 'test']:
             trainer.test(model, datamodule=datamodule, ckpt_path=cfg.general.checkpoint_strategy)
     else:
-        # Start by evaluating test_only_path
-        trainer.test(model, datamodule=datamodule, ckpt_path=cfg.general.test_only)
+        if _is_pl_checkpoint(cfg.general.test_only):
+            trainer.test(model, datamodule=datamodule, ckpt_path=cfg.general.test_only)
+        else:
+            # Raw state dict — weights already loaded above, run test without ckpt_path
+            trainer.test(model, datamodule=datamodule)
         if cfg.general.evaluate_all_checkpoints:
             directory = pathlib.Path(cfg.general.test_only).parents[0]
             logging.info("Directory:", directory)

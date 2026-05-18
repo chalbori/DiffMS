@@ -3,15 +3,15 @@ name: 'dev' # Warning: 'debug' and 'test' are reserved name that have a special 
 
 parent_dir: '.'
 
-wandb: 'online'             # online | offline | disabled
+wandb: 'disabled'
 wandb_name: 'mass_spec_exp'
-gpus: 1                     # Multi-gpu is not implemented on this branch
+gpus: 0                     # CUDA GPU count (0 = CPU/MPS auto-detected)
 
 decoder: null # path to pretrained decoder
 encoder: null # path to pretrained encoder
 
 resume: null
-test_only: null
+test_only: /Users/chalbori/Dev_others/DiffMS/checkpoints/checkpoints/diffms_msg.ckpt
 load_weights: null
 
 encoder_finetune_strategy: null  # null | freeze | ft-unfold | freeze-unfold | freeze-transformer | ft-transformer
@@ -19,8 +19,8 @@ decoder_finetune_strategy: null  # null | freeze | ft-input | freeze-input | ft-
 
 check_val_every_n_epochs: 1
 sample_every_val: 1000
-val_samples_to_generate: 100
-test_samples_to_generate: 100
+val_samples_to_generate: 10
+test_samples_to_generate: 10
 log_every_steps: 50
 
 evaluate_all_checkpoints: False
