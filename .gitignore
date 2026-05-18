@@ -143,6 +143,8 @@ checkpoints_internal/*
 checkpoints_save/*
 notebooks/data/*
 data/*
+!data/sop/
+!data/sop/**
 
 __pycache__/
 **/__pycache__/
