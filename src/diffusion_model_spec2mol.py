@@ -644,7 +644,7 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         return self.decoder(X, E, y, node_mask)
     
     @torch.no_grad()
-    def sample_batch(self, data: Batch) -> Batch:
+    def sample_batch(self, data: Batch, return_graphs: bool = False):
         dense_data, node_mask = utils.to_dense(data.x, data.edge_index, data.edge_attr, data.batch)
 
         z_T = diffusion_utils.sample_discrete_feature_noise(limit_dist=self.limit_dist, node_mask=node_mask)
@@ -665,6 +665,10 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
 
         # Sample
         sampled_s.X = X
+        # Capture one-hot tensors before collapse (needed for NLL scoring)
+        X_onehot = sampled_s.X.clone()  # (bs, n, dx)
+        E_onehot = sampled_s.E.clone()  # (bs, n, n, de)
+
         sampled_s = sampled_s.mask(node_mask, collapse=True)
         X, E, y = sampled_s.X, sampled_s.E, data.y
 
@@ -672,7 +676,75 @@ class Spec2MolDenoisingDiffusion(pl.LightningModule):
         for nodes, adj_mat in zip(X, E):
             mols.append(self.visualization_tools.mol_from_graphs(nodes, adj_mat))
 
+        if return_graphs:
+            return mols, X_onehot, E_onehot, node_mask
         return mols
+
+    @torch.no_grad()
+    def compute_mol_nll(self, X, E, y, node_mask, n_mc: int = 5) -> torch.Tensor:
+        """Monte Carlo ELBO estimate per molecule. Lower NLL = more likely under the model.
+
+        Args:
+            X: (bs, n, dx) one-hot atom types
+            E: (bs, n, n, de) one-hot edge types
+            y: (bs, dy) spectrum conditioning vector
+            node_mask: (bs, n) bool
+            n_mc: Monte Carlo samples over random time steps (for variance reduction)
+        Returns:
+            (bs,) NLL estimates
+        """
+        bs = X.size(0)
+        n  = X.size(1)
+        nlls_acc = torch.zeros(bs, device=X.device)
+
+        N      = node_mask.sum(1).long()
+        log_pN = self.node_dist.log_prob(N)       # (bs,)
+        kl_pr  = self.kl_prior(X, E, node_mask)   # (bs,)
+
+        for _ in range(n_mc):
+            noisy_data = self.apply_noise(X, E, y, node_mask)
+            extra_data = self.compute_extra_data(noisy_data)
+            pred       = self.forward(noisy_data, extra_data, node_mask)
+
+            pred_probs_X = F.softmax(pred.X, dim=-1)
+            pred_probs_E = F.softmax(pred.E, dim=-1)
+            pred_probs_y = F.softmax(pred.y, dim=-1)
+
+            Qtb = self.transition_model.get_Qt_bar(noisy_data['alpha_t_bar'], self.device)
+            Qsb = self.transition_model.get_Qt_bar(noisy_data['alpha_s_bar'], self.device)
+            Qt  = self.transition_model.get_Qt(noisy_data['beta_t'], self.device)
+
+            prob_true = diffusion_utils.posterior_distributions(
+                X=X, E=E, y=y,
+                X_t=noisy_data['X_t'], E_t=noisy_data['E_t'], y_t=noisy_data['y_t'],
+                Qt=Qt, Qsb=Qsb, Qtb=Qtb)
+            prob_true.E = prob_true.E.reshape((bs, n, n, -1))
+            prob_pred = diffusion_utils.posterior_distributions(
+                X=pred_probs_X, E=pred_probs_E, y=pred_probs_y,
+                X_t=noisy_data['X_t'], E_t=noisy_data['E_t'], y_t=noisy_data['y_t'],
+                Qt=Qt, Qsb=Qsb, Qtb=Qtb)
+            prob_pred.E = prob_pred.E.reshape((bs, n, n, -1))
+
+            prob_true_X, prob_true_E, prob_pred_X, prob_pred_E = diffusion_utils.mask_distributions(
+                true_X=prob_true.X, true_E=prob_true.E,
+                pred_X=prob_pred.X, pred_E=prob_pred.E,
+                node_mask=node_mask)
+
+            # Per-sample KL (sum over all non-batch dims)
+            kl_x   = diffusion_utils.sum_except_batch(
+                F.kl_div(torch.log(prob_pred_X), prob_true_X, reduction='none'))
+            kl_e   = diffusion_utils.sum_except_batch(
+                F.kl_div(torch.log(prob_pred_E), prob_true_E, reduction='none'))
+            loss_t = self.T * (kl_x + kl_e)  # (bs,)
+
+            # Reconstruction loss (t=0)
+            prob0  = self.reconstruction_logp(noisy_data['t'], X, E, y, node_mask)
+            loss_0 = (diffusion_utils.sum_except_batch(X * prob0.X.log()) +
+                      diffusion_utils.sum_except_batch(E * prob0.E.log()))  # (bs,)
+
+            nlls_acc += -log_pN + kl_pr + loss_t - loss_0
+
+        return nlls_acc / n_mc
 
     def sample_p_zs_given_zt(self, s, t, X_t, E_t, y_t, node_mask):
         """Samples from zs ~ p(zs | zt). Only used during sampling.

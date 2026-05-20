@@ -14,6 +14,7 @@ Runtime estimate (MPS, n_samples=20):
     ~296 denoising calls × ~30 s ≈ ~2.5 h
 """
 import argparse
+import math
 import os
 import sys
 import time
@@ -124,12 +125,21 @@ def sample_batch_repeated(model, data, y, n_samples: int, device):
 
     Replicates the graph n_samples times so the 500-step denoising loop
     processes all samples in parallel instead of sequentially.
+
+    Returns:
+        mols: list of n_samples RDKit molecules
+        X_onehot: (n_samples, n, dx) one-hot atom types
+        E_onehot: (n_samples, n, n, de) one-hot edge types
+        node_mask: (n_samples, n) bool
+        y_rep: (n_samples, dy) spectrum conditioning vector
     """
     single = data.get_example(0)
     data_list = [single.clone() for _ in range(n_samples)]
     batch_rep = Batch.from_data_list(data_list).to(device)
-    batch_rep.y = y.expand(n_samples, -1).contiguous()
-    return model.sample_batch(batch_rep)   # list of n_samples RDKit mols
+    y_rep = y.expand(n_samples, -1).contiguous()
+    batch_rep.y = y_rep
+    mols, X_onehot, E_onehot, node_mask = model.sample_batch(batch_rep, return_graphs=True)
+    return mols, X_onehot, E_onehot, node_mask, y_rep
 
 
 # ── Model loading ─────────────────────────────────────────────────────────────
@@ -152,15 +162,15 @@ def load_model(cfg, ckpt_path, dataset_infos, train_metrics,
 
 # ── Metrics ──────────────────────────────────────────────────────────────────
 
-def top_k_hit(pred_smiles_list, true_key14: str, ks=(1, 5, 10, 20)) -> dict:
-    hits = {}
+def recall_at_k(pred_smiles_list, true_key14: str, ks=(1, 5, 10, 20)) -> dict:
+    result = {}
     for k in ks:
-        hits[f"hit@{k}"] = False
+        result[f"recall@{k}"] = False
         for smi in pred_smiles_list[:k]:
             if canonical_inchikey14(smi) == true_key14:
-                hits[f"hit@{k}"] = True
+                result[f"recall@{k}"] = True
                 break
-    return hits
+    return result
 
 
 def max_tanimoto(pred_smiles_list, true_fp) -> float:
@@ -180,6 +190,8 @@ def main():
                         help="Retries on sampling error (per spectrum)")
     parser.add_argument("--max-test", type=int, default=None,
                         help="Limit number of test spectra (for debugging)")
+    parser.add_argument("--nll-mc", type=int, default=5,
+                        help="Monte Carlo samples for NLL scoring (higher = more accurate, slower)")
     args = parser.parse_args()
 
     device   = detect_device(args.device)
@@ -247,16 +259,56 @@ def main():
     if args.max_test:
         n_test = min(n_test, args.max_test)
     print(f"\nTest spectra: {n_test}")
-    print(f"Starting inference...\n")
 
+    # ── Resume support ────────────────────────────────────────────────────────
+    out_csv = out_dir / "predictions.csv"
+    progress_file = out_dir / "progress.txt"
     rows = []
+    done_ids: set = set()
+    if out_csv.exists():
+        prev = pd.read_csv(out_csv)
+        rows = prev.to_dict("records")
+        done_ids = set(prev["spec_id"].astype(str))
+        print(f"Resuming: {len(done_ids)} spectra already done, skipping them.\n")
+    else:
+        print(f"Starting inference...\n")
+
     spec_idx = 0
+    run_start = time.time()
+
+
+    def write_progress(done, total, rows, elapsed_last):
+        elapsed_total = time.time() - run_start
+        avg_s = elapsed_total / done if done else 0
+        eta_s = avg_s * (total - done)
+        eta_h, eta_m = divmod(int(eta_s), 3600)
+        eta_m //= 60
+
+        df = pd.DataFrame(rows)
+        recall_cols = [c for c in df.columns if c.startswith("recall@")]
+        recall_lines = "".join(
+            f"  {col:<14}: {df[col].mean() * 100:.1f}%\n" for col in recall_cols
+        ) if recall_cols else "  (no ground truth yet)\n"
+
+        with open(progress_file, "w") as f:
+            f.write(f"Progress  : {done}/{total}  ({done/total*100:.1f}%)\n")
+            f.write(f"Elapsed   : {elapsed_total/3600:.1f}h  ({avg_s:.0f}s/spec)\n")
+            f.write(f"ETA       : {eta_h}h {eta_m:02d}m\n")
+            f.write(f"Last spec : {elapsed_last:.0f}s\n")
+            f.write(f"---\n")
+            if len(df):
+                f.write(f"SMILES validity (mean per spectrum): {df['valid'].mean() / args.num_samples * 100:.1f}%\n")
+                f.write(f"Max Tan   : {df['max_tanimoto'].mean():.4f}\n")
+            f.write(recall_lines)
 
     with torch.no_grad():
         for batch in (x for i, x in enumerate(test_loader) if i < n_test):
             spec_idx += 1
             # batch["names"] is populated by the PeakFormula collate fn
             spec_id = str(batch["names"][0])
+
+            if spec_id in done_ids:
+                continue
 
             true_row = labels_df[labels_df["spec"].astype(str) == spec_id]
             true_smiles = true_row["smiles"].iloc[0] if not true_row.empty else None
@@ -281,23 +333,46 @@ def main():
                 continue
 
             # Sample (with retry on error)
-            mols = []
+            mols, X_onehot, E_onehot, node_mask_rep, y_rep = [], None, None, None, None
             for attempt in range(args.max_attempts):
                 try:
-                    mols = sample_batch_repeated(model, data, y, args.num_samples, device)
+                    mols, X_onehot, E_onehot, node_mask_rep, y_rep = \
+                        sample_batch_repeated(model, data, y, args.num_samples, device)
                     break
                 except Exception as e:
                     if attempt == args.max_attempts - 1:
                         print(f"  [{spec_idx}/{n_test}] {spec_id}  SAMPLE ERROR: {e}")
 
+            # NLL scoring: rank candidates by model likelihood (lower NLL = more likely)
+            nll_values = [float("nan")] * len(mols)
+            order = list(range(len(mols)))
+            if mols and X_onehot is not None:
+                try:
+                    nlls = model.compute_mol_nll(
+                        X_onehot, E_onehot, y_rep, node_mask_rep, n_mc=args.nll_mc)
+                    order = nlls.argsort().tolist()
+                    nll_values = nlls.tolist()
+                except Exception as e:
+                    print(f"  [{spec_idx}/{n_test}] {spec_id}  NLL ERROR (unranked): {e}")
+                    # Sync CUDA to surface any device-side errors and clear them
+                    if device.type == "cuda":
+                        try:
+                            torch.cuda.synchronize()
+                        except Exception:
+                            pass
+
             elapsed = time.time() - t0
 
+            # Reorder molecules by NLL (best first)
+            mols_ranked = [mols[i] for i in order]
+            nll_ranked  = [nll_values[i] for i in order]
+
             # Convert to SMILES
-            pred_smiles = [mol_to_smiles(m) for m in mols]
+            pred_smiles = [mol_to_smiles(m) for m in mols_ranked]
             valid_smiles = [s for s in pred_smiles if s]
 
             # Metrics
-            hits      = top_k_hit(valid_smiles, true_key14) if true_key14 else {}
+            hits      = recall_at_k(valid_smiles, true_key14) if true_key14 else {}
             max_tan   = max_tanimoto(valid_smiles, true_fp)
             valid_n   = len(valid_smiles)
 
@@ -309,31 +384,35 @@ def main():
                 **{k: int(v) for k, v in hits.items()},
                 "elapsed_s":    round(elapsed, 1),
             }
-            # Store top-20 predictions
-            for rank, smi in enumerate(pred_smiles, 1):
+            # Store predictions in NLL-ranked order with their scores
+            for rank, (smi, nll_val) in enumerate(zip(pred_smiles, nll_ranked), 1):
                 row[f"pred_{rank}"] = smi
+                row[f"nll_{rank}"]  = round(nll_val, 4) if not math.isnan(nll_val) else None
             rows.append(row)
 
-            hit_str = "  ".join(f"{k}={'✓' if v else '✗'}" for k, v in hits.items())
+            recall_str = "  ".join(f"{k}={'✓' if v else '✗'}" for k, v in hits.items())
             print(f"  [{spec_idx:>3}/{n_test}] {spec_id}  "
                   f"valid={valid_n}/{args.num_samples}  "
-                  f"tan={max_tan:.3f}  {hit_str}  ({elapsed:.0f}s)")
+                  f"tan={max_tan:.3f}  {recall_str}  ({elapsed:.0f}s)")
+
+            # Update progress file and partial CSV after every spectrum
+            write_progress(spec_idx, n_test, rows, elapsed)
+            pd.DataFrame(rows).to_csv(out_csv, index=False)
 
     # ── Save results ──────────────────────────────────────────────────────────
     results_df = pd.DataFrame(rows)
-    out_csv = out_dir / "predictions.csv"
     results_df.to_csv(out_csv, index=False)
 
     # ── Summary ───────────────────────────────────────────────────────────────
     n = len(results_df)
-    hit_cols = [c for c in results_df.columns if c.startswith("hit@")]
+    recall_cols = [c for c in results_df.columns if c.startswith("recall@")]
     W = 56
     print(f"\n{'=' * W}")
     print(f"  Spectra evaluated : {n}")
     print(f"  Validity (mean)   : {results_df['valid'].mean() / args.num_samples * 100:.1f}%")
     print(f"  Max Tanimoto (mean): {results_df['max_tanimoto'].mean():.4f}")
-    if hit_cols:
-        for col in hit_cols:
+    if recall_cols:
+        for col in recall_cols:
             rate = results_df[col].mean() * 100
             print(f"  {col:<18}: {rate:.1f}%")
     print(f"  Results saved     : {out_csv}")
